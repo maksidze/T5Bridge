@@ -1552,7 +1552,49 @@ namespace
             closeDialogue();
         }
 
-        std::string playerInventoryJson(std::uint32_t owner)
+        std::string inventoryItemDetails(const TES5Viewer::RecordPayload& record)
+        {
+            const auto type = record.metadata.recordType;
+            const bool alchemy = type == ESM::fourCC("ALCH") || type == ESM::fourCC("INGR");
+            std::optional<std::uint32_t> value, damage;
+            std::optional<float> weight;
+            bool food = false;
+            TES5Viewer::visitSubrecords(record, [&](auto tag, auto data) {
+                if (tag == ESM::fourCC("ENIT") && alchemy && data.size() >= 4)
+                {
+                    value = word(data);
+                    food = type == ESM::fourCC("ALCH") && data.size() >= 8 && (word(data, 4) & 2) != 0;
+                }
+                if (tag != ESM::fourCC("DATA")) return;
+                const auto readWeight = [&](std::size_t offset) {
+                    if (data.size() < offset + 4) return;
+                    const float candidate = std::bit_cast<float>(word(data, offset));
+                    if (std::isfinite(candidate) && candidate >= 0 && candidate <= 10000) weight = candidate;
+                };
+                if (alchemy)
+                    readWeight(0);
+                else if (type == ESM::fourCC("AMMO"))
+                {
+                    if (data.size() >= 16) value = word(data, 12);
+                    readWeight(16);
+                }
+                else if (type == ESM::fourCC("BOOK") || type == ESM::fourCC("SCRL") || type == ESM::fourCC("WEAP")
+                    || type == ESM::fourCC("ARMO") || type == ESM::fourCC("MISC") || type == ESM::fourCC("KEYM")
+                    || type == ESM::fourCC("SLGM"))
+                {
+                    const std::size_t offset = type == ESM::fourCC("BOOK") ? 8 : 0;
+                    if (data.size() >= offset + 4) value = word(data, offset);
+                    readWeight(offset + 4);
+                    if (type == ESM::fourCC("WEAP") && data.size() >= 10)
+                        damage = std::to_integer<std::uint32_t>(data[8]) | (std::to_integer<std::uint32_t>(data[9]) << 8);
+                }
+            });
+            return std::format("{{\"food\":{},\"weight\":{},\"value\":{},\"damage\":{}}}", food,
+                weight ? std::format("{}", *weight) : "null", value ? std::to_string(*value) : "null",
+                damage ? std::to_string(*damage) : "null");
+        }
+
+        std::string playerInventoryJson(std::uint32_t owner, bool details = false)
         {
             if (owner == 0x14 ? !canUseInventory() : !canLoot(owner)) return {};
             const auto base = inventoryBase(owner);
@@ -1566,8 +1608,9 @@ namespace
                 if (!TES5Viewer::isInventoryItem(type)) continue;
                 const bool equipped = owner == 0x14 && (playerWeapon == item
                     || (outfits.contains(owner) && outfits.at(owner).contains(item)));
-                result += std::format(",[{},{},{},{},{}]", item, count, jsonText(itemName(record)),
-                    type, equipped ? "true" : "false");
+                result += std::format(",[{},{},{},{},{}", item, count, jsonText(itemName(record)), type, equipped);
+                if (details) result += ',' + inventoryItemDetails(record);
+                result += ']';
             }
             return result + ']';
         }
@@ -3673,6 +3716,56 @@ T5_BRIDGE_API const char* T5PapyrusInventory(void* handle, std::uint32_t owner) 
         return session.inventoryJson.empty() ? nullptr : session.inventoryJson.c_str();
     }
     catch (const std::exception& error) { session.log.write("Inventory", error.what()); return nullptr; }
+}
+
+T5_BRIDGE_API const char* T5PapyrusInventoryPresentation(void* handle, std::uint32_t owner) noexcept
+{
+    auto& session = *static_cast<PapyrusSession*>(handle);
+    if (!session.state) return nullptr;
+    try
+    {
+        session.state->syncQuestItems();
+        session.inventoryJson = session.state->playerInventoryJson(owner, true);
+        return session.inventoryJson.empty() ? nullptr : session.inventoryJson.c_str();
+    }
+    catch (const std::exception& error) { session.log.write("Inventory presentation", error.what()); return nullptr; }
+}
+
+T5_BRIDGE_API void* T5PapyrusInventoryModel(const void* handle, std::uint32_t id) noexcept
+{
+    return performLoad([&](LoadResult& result) {
+        const auto& state = static_cast<const PapyrusSession*>(handle)->state;
+        if (!state || !state->vfs) throw std::runtime_error("Inventory model has no mounted resources");
+        const auto record = state->read(id);
+        const auto type = record.metadata.recordType;
+        if (!TES5Viewer::isInventoryItem(type)) throw std::runtime_error("Form is not an inventory item");
+        std::string model, fallback;
+        TES5Viewer::visitSubrecords(record, [&](auto tag, auto data) {
+            if (tag == ESM::fourCC("MODL")) model = TES5Viewer::characterString(data);
+            if (type == ESM::fourCC("ARMO") && tag == ESM::fourCC("MOD2")) fallback = TES5Viewer::characterString(data);
+        });
+        if (model.empty()) model = std::move(fallback);
+        model = TES5Viewer::modelAssetPath(model);
+        if (model.empty()) throw std::runtime_error("Inventory item has no world model");
+        TES5Viewer::exportAnimationObject(*state->vfs, state->read, model, result.buffers, false);
+        result.buffers.emplace("prop.json", "{\"socket\":\"\",\"unload\":\"\"}");
+    });
+}
+
+T5_BRIDGE_API int T5PapyrusResourcePools(const void* handle, float* ratios) noexcept
+{
+    const auto& state = static_cast<const PapyrusSession*>(handle)->state;
+    if (!state || !ratios) return 0;
+    try
+    {
+        for (std::uint32_t index = 0; index < 3; ++index)
+        {
+            const auto pool = state->world.resourcePool(0x14, 24 + index);
+            ratios[index] = pool ? std::clamp(pool->first / pool->second, 0.f, 1.f) : -1.f;
+        }
+        return 1;
+    }
+    catch (const std::exception&) { return 0; }
 }
 
 T5_BRIDGE_API int T5PapyrusInventoryAction(void* handle, std::uint32_t owner, std::uint32_t item,

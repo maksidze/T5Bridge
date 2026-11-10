@@ -138,9 +138,11 @@ namespace TES5Viewer
         };
 
         std::set<std::string> orderedArchives;
+        // Keep the usual archive priority while allowing different archive layouts
+        // and loose resources to supply the assets requested by a scene.
         for (const auto& archive : coreRenderArchives())
         {
-            appendArchive(archive, "core", "", true);
+            appendArchive(archive, "core", "", false);
             orderedArchives.insert(VFS::Path::normalizeFilename(archive));
         }
         std::set<std::string> activeOwners;

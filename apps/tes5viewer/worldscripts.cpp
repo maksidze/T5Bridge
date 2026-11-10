@@ -291,11 +291,14 @@ namespace TES5Viewer
             Bytes value;
         };
 
+        constexpr std::uint32_t preferredSpeedFlag = 0x2000;
+
         struct Procedure
         {
             std::string name;
             std::vector<std::uint8_t> inputs;
             Conditions conditions;
+            std::optional<std::uint8_t> speedOverride;
             bool completesPackage = false;
         };
 
@@ -305,11 +308,17 @@ namespace TES5Viewer
             PackageVmad vmad;
             std::uint32_t owner = 0, templateId = 0;
             std::uint8_t speed = 0;
+            bool hasPreferredSpeed = false;
             std::uint32_t beginIdle = 0, endIdle = 0, changeIdle = 0;
             std::map<std::uint8_t, Input> inputs;
             Conditions conditions;
             std::vector<Procedure> procedures;
             bool anySchedule = true, mustComplete = false, repeats = false, otherBranches = false, inventoryWeapon = false;
+
+            std::uint8_t preferredSpeed(const Procedure& procedure) const
+            {
+                return procedure.speedOverride.value_or(hasPreferredSpeed ? speed : 0);
+            }
 
             explicit Package(RecordPayload source) : record(std::move(source))
             {
@@ -329,7 +338,9 @@ namespace TES5Viewer
                     else if (tag == fourCC("PKDT"))
                     {
                         speed = static_cast<std::uint8_t>(integer(bytes, 6, 1));
-                        mustComplete = (integer(bytes) & 4) != 0;
+                        const auto flags = integer(bytes);
+                        hasPreferredSpeed = (flags & preferredSpeedFlag) != 0;
+                        mustComplete = (flags & 4) != 0;
                     }
                     else if (tag == fourCC("PKCU"))
                         templateId = record.mapFormId(integer(bytes, 4));
@@ -382,6 +393,13 @@ namespace TES5Viewer
                         procedure->name = string(bytes);
                     else if (procedure && tag == fourCC("PKC2"))
                         procedure->inputs.push_back(static_cast<std::uint8_t>(integer(bytes, 0, 1)));
+                    else if (procedure && tag == fourCC("PFO2"))
+                    {
+                        if (integer(bytes, 4) & preferredSpeedFlag)
+                            procedure->speedOverride = 0;
+                        else if (integer(bytes) & preferredSpeedFlag)
+                            procedure->speedOverride = static_cast<std::uint8_t>(integer(bytes, 12, 1));
+                    }
                     else if (procedure && tag == fourCC("FNAM"))
                         procedure->completesPackage = (integer(bytes) & 1) != 0;
                     else if (tag == fourCC("POBA") || tag == fourCC("POEA") || tag == fourCC("POCA"))
@@ -1325,7 +1343,7 @@ namespace TES5Viewer
             return true;
         }
 
-        void playLocomotion(std::uint32_t actor, std::string_view gait)
+        void playLocomotion(std::uint32_t actor, std::string_view gait, float playbackSpeed = 1.f)
         {
             normalizedFurnitureActors.erase(actor);
             occupiedPerches.erase(actor);
@@ -1337,7 +1355,7 @@ namespace TES5Viewer
             if (gait == "BHR_Default::FlyStartCruise")
                 playFlightEvent(actor, gait);
             else
-                animations.push_back({actor, 0, {}, std::string(gait)});
+                animations.push_back({actor, 0, {}, std::string(gait), {}, playbackSpeed});
         }
 
         void stopLocomotion(std::uint32_t actor)
@@ -2199,7 +2217,7 @@ namespace TES5Viewer
                 if (const auto door = travelDoor(target, *start)) end = door->door;
             if (!start || !end)
                 throw std::runtime_error("PACK movement target or actor has no position");
-            CartRoute route{active.id, {{mover, start->position}}, selected.speed};
+            CartRoute route{active.id, {{mover, start->position}}, selected.preferredSpeed(procedure)};
             const auto* repeat = input(selected, *active.tree, procedure, 2);
             const bool repeatable = repeat && repeat->value.size() == 1 && integer(repeat->value, 0, 1);
             const auto append = [&](std::uint32_t marker, std::uint32_t until) {
@@ -2259,11 +2277,12 @@ namespace TES5Viewer
                 routeTrace << std::hex << point.referenceId << std::dec << ',';
             const bool perch = (procedure.name == "Sit" || procedure.name == "FindSit") && flyingFurniture(actor, target);
             const bool allowFlight = patrol || perch;
-            const auto speed = perch ? std::uint8_t{0} : selected.speed;
+            if (perch) route.preferredSpeed = 0;
+            const auto speed = route.preferredSpeed;
             active.speed = movementSpeed(mover, speed, false, allowFlight);
             active.turnSpeed = movementSpeed(mover, speed, true, allowFlight);
             routeTrace << " length=" << cartRouteLength(route) << " speed=" << active.speed
-                << " turnRate=" << active.turnSpeed << " preferred=" << unsigned(selected.speed);
+                << " turnRate=" << active.turnSpeed << " preferred=" << unsigned(speed);
             events.push_back({active.id, "PACK", "Route", {{routeTrace.str(), 0}}, time, {}, 0});
             active.length = cartRouteLength(route);
             if (procedure.name == "Travel")
@@ -2575,9 +2594,32 @@ namespace TES5Viewer
                     && flyingFurniture(actor, active.route->points.back().referenceId)))
                 && !flightProfile(mover).behavior.empty();
             if (flying && noFlight.contains(mover)) return false;
+            if (!flying)
+            {
+                // Checkpoints may contain routes prepared before PACK speed flags were applied.
+                const auto preferred = package(active.id).preferredSpeed(procedure);
+                if (active.route->preferredSpeed != preferred)
+                {
+                    active.route->preferredSpeed = preferred;
+                    active.speed = movementSpeed(mover, preferred, false, false);
+                    active.turnSpeed = movementSpeed(mover, preferred, true, false);
+                }
+            }
             if (active.length > active.distance && !deadActors.contains(mover))
-                playLocomotion(mover, flying ? "BHR_Default::FlyStartCruise" : active.route->preferredSpeed == 2 ? "T5Run"
-                    : active.route->preferredSpeed == 1 ? "T5Jog" : "T5Walk");
+            {
+                if (flying)
+                    playLocomotion(mover, "BHR_Default::FlyStartCruise");
+                else
+                {
+                    switch (active.route->preferredSpeed)
+                    {
+                        case 1: playLocomotion(mover, "T5Jog", active.speed / movementSpeed(mover, 2, false, false)); break;
+                        case 2: playLocomotion(mover, "T5Run"); break;
+                        case 3: playLocomotion(mover, "T5FastWalk", active.speed / movementSpeed(mover, 0, false, false)); break;
+                        default: playLocomotion(mover, "T5Walk"); break;
+                    }
+                }
+            }
             const double speed = procedure.name == "Orbit" && active.loopStart && active.distance >= *active.loopStart
                 ? std::min(active.speed, (active.length - *active.loopStart) * active.turnSpeed / (2 * std::numbers::pi))
                 : active.speed;
@@ -4002,11 +4044,11 @@ namespace TES5Viewer
         return shot;
     }
 
-    bool WorldScripts::restoreActorValue(std::uint32_t actor, std::uint32_t value, float amount)
+    std::optional<std::pair<float, float>> WorldScripts::resourcePool(std::uint32_t actor, std::uint32_t value) const
     {
-        if (value < 24 || value > 26 || !(amount > 0) || !std::isfinite(amount) || isDead(actor)) return false;
+        if (value < 24 || value > 26) return std::nullopt;
         const auto base = mImpl->actorBase(actor);
-        if (!base) return false;
+        if (!base) return std::nullopt;
         float maximum = value == 24 ? mImpl->actorHealth(base).first : 0.f;
         if (value != 24)
         {
@@ -4020,9 +4062,19 @@ namespace TES5Viewer
                 });
             });
         }
-        if (maximum <= 0) return false;
+        if (!std::isfinite(maximum) || maximum <= 0) return std::nullopt;
+        const auto current = mImpl->actorValues.find({actor, value});
+        return std::pair{current == mImpl->actorValues.end() ? maximum : current->second, maximum};
+    }
+
+    bool WorldScripts::restoreActorValue(std::uint32_t actor, std::uint32_t value, float amount)
+    {
+        if (!(amount > 0) || !std::isfinite(amount) || isDead(actor)) return false;
+        const auto pool = resourcePool(actor, value);
+        if (!pool) return false;
+        const auto [previous, maximum] = *pool;
         auto& current = mImpl->actorValues.try_emplace(std::pair{actor, value}, maximum).first->second;
-        current = std::min(maximum, current + amount);
+        current = std::min(maximum, previous + amount);
         return true;
     }
 

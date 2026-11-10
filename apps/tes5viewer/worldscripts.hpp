@@ -132,6 +132,7 @@ namespace TES5Viewer
         bool wasKilled(std::uint32_t actor) const;
         bool strike(std::uint32_t target, std::uint32_t source, std::uint32_t weapon, float damage);
         bool restoreActorValue(std::uint32_t actor, std::uint32_t value, float amount);
+        std::optional<std::pair<float, float>> resourcePool(std::uint32_t actor, std::uint32_t value) const;
         std::uint32_t registerPlayerArrow(const ArrowLoadout& loadout);
         void setTriggerActorBounds(std::uint32_t actor, const osg::BoundingBoxd& bounds);
         void setTriggers(std::span<const PreparedSceneScript> scripts, const std::map<std::uint32_t, std::uint32_t>& actors,
