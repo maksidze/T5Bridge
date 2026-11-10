@@ -453,7 +453,9 @@ namespace Nif
             nif->read(mVertexSize);
             mVertexDesc.read(nif);
 
-            uint32_t numVertices = mDataSize / mVertexSize;
+            if (mDataSize != 0 && (mVertexSize == 0 || mDataSize % mVertexSize != 0))
+                throw Nif::Exception("Invalid Skyrim SE skin partition vertex data size", nif->getFile().getFilename());
+            const uint32_t numVertices = mDataSize == 0 ? 0 : mDataSize / mVertexSize;
             mVertexData.reserve(numVertices);
             for (uint32_t i = 0; i < numVertices; ++i)
                 mVertexData.emplace_back().read(nif, mVertexDesc.mFlags);

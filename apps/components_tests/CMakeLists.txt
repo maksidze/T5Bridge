@@ -70,6 +70,7 @@ file(GLOB UNITTEST_SRC_FILES
     toutf8/toutf8.cpp
 
     esm4/includes.cpp
+    esm4/testlocalizedstrings.cpp
 
     fx/lexer.cpp
     fx/technique.cpp

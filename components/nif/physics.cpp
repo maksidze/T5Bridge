@@ -9,6 +9,12 @@ namespace Nif
 {
     namespace
     {
+        void readHavokQuaternion(NIFStream& stream, osg::Quat& value)
+        {
+            const auto components = stream.get<osg::Vec4f>();
+            value.set(components.x(), components.y(), components.z(), components.w());
+        }
+
         void readBoneTransformGroup(NIFStream& stream, std::vector<bhkPoseArray::BoneTransform>& value)
         {
             stream.readVectorOfRecords<uint32_t>(value);
@@ -88,7 +94,7 @@ namespace Nif
     void bhkQsTransform::read(NIFStream* nif)
     {
         nif->read(mTranslation);
-        nif->read(mRotation);
+        readHavokQuaternion(*nif, mRotation);
     }
 
     void bhkCMSBigTri::read(NIFStream* nif)
@@ -129,7 +135,7 @@ namespace Nif
         if (nif->getBethVersion() < 83)
             nif->skip(4); // Unused
         nif->read(mTranslation);
-        nif->read(mRotation);
+        readHavokQuaternion(*nif, mRotation);
         nif->read(mLinearVelocity);
         nif->read(mAngularVelocity);
         // A bit hacky, but this is the only instance where a 3x3 matrix has padding.
@@ -806,6 +812,12 @@ namespace Nif
             nif->read(mBodyFlags);
         else
             mBodyFlags = nif->get<uint16_t>();
+    }
+
+    void bhkRigidBody::post(Reader& nif)
+    {
+        bhkEntity::post(nif);
+        postRecordList(nif, mConstraints);
     }
 
     void bhkAabbPhantom::read(NIFStream* nif)

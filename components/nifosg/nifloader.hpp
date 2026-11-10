@@ -3,6 +3,8 @@
 
 #include <components/nif/niffile.hpp>
 
+#include <map>
+#include <osg/Matrixf>
 #include <osg/ref_ptr>
 
 namespace SceneUtil
@@ -23,6 +25,9 @@ namespace Resource
 
 namespace NifOsg
 {
+    // Changes from bind pose in model space, keyed by the NIF bone name.
+    using SkinPose = std::map<std::string, osg::Matrixf, std::less<>>;
+
     /// The main class responsible for loading NIF files into an OSG-Scenegraph.
     /// @par This scene graph is self-contained and can be cloned using osg::clone if desired. Particle emitters
     ///      and programs hold a pointer to their ParticleSystem, which would need to be manually updated when cloning.
@@ -33,6 +38,9 @@ namespace NifOsg
         /// if so.
         static osg::ref_ptr<osg::Node> load(
             Nif::FileView file, Resource::ImageManager* imageManager, Resource::BgsmFileManager* materialManager);
+
+        static osg::ref_ptr<osg::Node> loadPosed(Nif::FileView file, Resource::ImageManager* imageManager,
+            Resource::BgsmFileManager* materialManager, const SkinPose& pose);
 
         /// Load keyframe controllers from the given kf file.
         static void loadKf(Nif::FileView kf, SceneUtil::KeyframeHolder& target);

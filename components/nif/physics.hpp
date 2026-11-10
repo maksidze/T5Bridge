@@ -769,6 +769,7 @@ namespace Nif
         uint32_t mBodyFlags;
 
         void read(NIFStream* nif) override;
+        void post(Reader& nif) override;
     };
 
     // Abstract non-physical object that receives collision events

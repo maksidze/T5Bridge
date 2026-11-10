@@ -52,6 +52,29 @@ namespace VFS
 
 namespace ESM4
 {
+    // Optional observations for parser diagnostics, not a measure of runtime or semantic support.
+    struct SubrecordDiagnostics
+    {
+        std::uint64_t mHeadersSeen = 0;
+        std::uint64_t mWholeSkipCalls = 0;
+        std::uint64_t mPartialSkipCalls = 0;
+        std::uint64_t mBytesExplicitlySkipped = 0;
+    };
+
+    struct ReaderDiagnostics
+    {
+        std::map<std::pair<std::uint32_t, std::uint32_t>, SubrecordDiagnostics> mSubrecords;
+        std::uint64_t mLocalizedLookups = 0;
+        std::uint64_t mLocalizedResolved = 0;
+        std::uint64_t mLocalizedMissing = 0;
+
+        // Raw file IDs and a physical file offset remain useful even for compressed records.
+        std::optional<std::uint64_t> mRecordOffset;
+        std::uint32_t mRecordType = 0;
+        std::uint32_t mFormId = 0;
+        std::optional<std::uint32_t> mSubrecordType;
+    };
+
 #pragma pack(push, 1)
     // NOTE: the label field of a group is not reliable (http://www.uesp.net/wiki/Tes4Mod:Mod_File_Format)
     union GroupLabel
@@ -172,6 +195,10 @@ namespace ESM4
 
         bool mIgnoreMissingLocalizedStrings = false;
 
+        ReaderDiagnostics* mDiagnostics = nullptr;
+        std::istream::pos_type mDiagnosticSubrecordStart = std::istream::pos_type(-1);
+        std::uint32_t mDiagnosticSubrecordSize = 0;
+
         void buildLStringIndex(LocalizedStringType stringType, std::string_view prefix);
 
         void buildLStringIndex(LocalizedStringType stringType, std::istream& stream);
@@ -199,7 +226,8 @@ namespace ESM4
 
     public:
         Reader(Files::IStreamPtr&& esmStream, const std::filesystem::path& filename, VFS::Manager const* vfs,
-            const ToUTF8::StatelessUtf8Encoder* encoder, bool ignoreMissingLocalizedStrings = false);
+            const ToUTF8::StatelessUtf8Encoder* encoder, bool ignoreMissingLocalizedStrings = false,
+            ReaderDiagnostics* diagnostics = nullptr);
 
         ~Reader();
 
@@ -233,6 +261,8 @@ namespace ESM4
         inline void get(T& t)
         {
             mStream->read((char*)&t, sizeof(T));
+            if (mDiagnostics != nullptr && mStream->gcount() != sizeof(T))
+                fail("Truncated record data");
         }
 
         // Use getFormId instead
@@ -242,6 +272,8 @@ namespace ESM4
         bool getExact(T& t)
         {
             mStream->read((char*)&t, sizeof(T));
+            if (mDiagnostics != nullptr && mStream->gcount() != sizeof(T))
+                fail("Truncated record data");
             return mStream->gcount() == sizeof(T); // FIXME: try/catch block needed?
         }
 
@@ -249,6 +281,8 @@ namespace ESM4
         inline bool get(void* p, std::size_t size)
         {
             mStream->read((char*)p, size);
+            if (mDiagnostics != nullptr && mStream->gcount() != static_cast<std::streamsize>(size))
+                fail("Truncated record data");
             return mStream->gcount() == (std::streamsize)size; // FIXME: try/catch block needed?
         }
 

@@ -90,3 +90,22 @@ venv/
 ## operating system files
 .DS_Store
 Thumbs.db
+
+## T5Bridge local inputs and outputs
+/Data
+/Saved/
+/reports/
+*.esm
+*.esl
+*.esp
+*.bsa
+*.ba2
+*.sav
+*.dll
+*.exe
+*.lib
+*.pdb
+*.7z
+*.zip
+*.log
+__pycache__/

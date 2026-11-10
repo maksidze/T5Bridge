@@ -47,6 +47,7 @@ option(BUILD_ESSIMPORTER        "Build ESS (Morrowind save game) importer" ON)
 option(BUILD_BSATOOL            "Build BSA extractor" ON)
 option(BUILD_ESMTOOL            "Build ESM inspector" ON)
 option(BUILD_NIFTEST            "Build nif file tester" ON)
+option(BUILD_TES5_UE_BRIDGE     "Build the Skyrim runtime data bridge for Unreal Engine" OFF)
 option(BUILD_DOCS               "Build documentation." OFF )
 option(BUILD_WITH_CODE_COVERAGE "Enable code coverage with gconv" OFF)
 option(BUILD_COMPONENTS_TESTS   "Build components library tests" OFF)
@@ -781,6 +782,10 @@ endif()
 
 if (BUILD_NIFTEST)
     add_subdirectory(apps/niftest)
+endif()
+
+if (BUILD_TES5_UE_BRIDGE)
+    add_subdirectory(apps/tes5viewer)
 endif()
 
 if (BUILD_COMPONENTS_TESTS)

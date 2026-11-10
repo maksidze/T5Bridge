@@ -128,12 +128,29 @@ namespace ESM4
             return std::nullopt;
         }
 
-        std::unique_ptr<Bsa::MemoryInputStream> decompress(
-            std::streamoff position, std::span<char> compressed, std::uint32_t uncompressedSize)
+        std::unique_ptr<Bsa::MemoryInputStream> decompress(std::streamoff position, std::span<char> compressed,
+            std::uint32_t uncompressedSize, bool diagnosticValidation)
         {
             auto result = std::make_unique<Bsa::MemoryInputStream>(uncompressedSize);
 
             const std::span decompressed(result->getRawData(), uncompressedSize);
+
+            if (diagnosticValidation)
+            {
+                z_stream stream{};
+                char emptyOutput = 0;
+                stream.next_in = reinterpret_cast<Bytef*>(compressed.data());
+                stream.avail_in = static_cast<uInt>(compressed.size());
+                stream.next_out = reinterpret_cast<Bytef*>(uncompressedSize == 0 ? &emptyOutput : decompressed.data());
+                stream.avail_out = uncompressedSize == 0 ? 1 : uncompressedSize;
+                if (const int ec = inflateInit(&stream); ec != Z_OK)
+                    throw std::runtime_error(getError("inflateInit error", ec, stream.msg));
+                const std::unique_ptr<z_stream, InflateEnd> streamPtr(&stream);
+                const int ec = inflate(&stream, Z_FINISH);
+                if (ec != Z_STREAM_END || stream.total_out != uncompressedSize || stream.total_in != compressed.size())
+                    throw std::runtime_error("Invalid compressed record: incomplete zlib stream or size mismatch");
+                return result;
+            }
 
             const auto allError = tryDecompressAll(compressed, decompressed);
             if (!allError.has_value())
@@ -175,12 +192,13 @@ namespace ESM4
     }
 
     Reader::Reader(Files::IStreamPtr&& esmStream, const std::filesystem::path& filename, VFS::Manager const* vfs,
-        const ToUTF8::StatelessUtf8Encoder* encoder, bool ignoreMissingLocalizedStrings)
+        const ToUTF8::StatelessUtf8Encoder* encoder, bool ignoreMissingLocalizedStrings, ReaderDiagnostics* diagnostics)
         : mVFS(vfs)
         , mEncoder(encoder)
         , mFileSize(0)
         , mStream(std::move(esmStream))
         , mIgnoreMissingLocalizedStrings(ignoreMissingLocalizedStrings)
+        , mDiagnostics(diagnostics)
     {
         // used by ESMReader only?
         mCtx.filename = filename;
@@ -418,7 +436,8 @@ namespace ESM4
         std::sort(strings.begin(), strings.end(),
             [](const LocalizedString& l, const LocalizedString& r) { return l.mOffset < r.mOffset; });
 
-        std::uint32_t lastOffset = 0;
+        // Offset zero is valid; only reuse a value after reading the first string.
+        std::optional<std::uint32_t> lastOffset;
         std::string_view lastValue;
 
         for (const LocalizedString& string : strings)
@@ -488,16 +507,22 @@ namespace ESM4
     // FIXME: very messy and probably slow/inefficient
     void Reader::getLocalizedStringImpl(const FormId stringId, std::string& str)
     {
+        if (mDiagnostics != nullptr)
+            ++mDiagnostics->mLocalizedLookups;
         const auto it = mLStringIndex.find(stringId);
 
         if (it == mLStringIndex.end())
         {
+            if (mDiagnostics != nullptr)
+                ++mDiagnostics->mLocalizedMissing;
             if (mIgnoreMissingLocalizedStrings)
                 return;
             throw std::runtime_error("ESM4::Reader::getLocalizedString localized string not found for "
                 + ESM::RefId(stringId).toDebugString());
         }
 
+        if (mDiagnostics != nullptr)
+            ++mDiagnostics->mLocalizedResolved;
         str = it->second;
     }
 
@@ -509,8 +534,45 @@ namespace ESM4
             mStream = std::move(mSavedStream);
         }
 
+        if (mDiagnostics != nullptr)
+        {
+            const auto offset = mStream->tellg();
+            mDiagnostics->mRecordOffset = offset == std::istream::pos_type(-1)
+                ? std::nullopt
+                : std::optional<std::uint64_t>(static_cast<std::uint64_t>(offset));
+            mDiagnostics->mRecordType = 0;
+            mDiagnostics->mFormId = 0;
+            mDiagnostics->mSubrecordType.reset();
+            mDiagnosticSubrecordStart = std::istream::pos_type(-1);
+        }
         mStream->read((char*)&mCtx.recordHeader, mCtx.recHeaderSize);
         std::size_t bytesRead = (std::size_t)mStream->gcount();
+
+        if (mDiagnostics != nullptr)
+        {
+            if (bytesRead >= sizeof(std::uint32_t))
+                mDiagnostics->mRecordType = mCtx.recordHeader.record.typeId;
+            if (bytesRead >= 16 && mDiagnostics->mRecordType != REC_GRUP)
+                mDiagnostics->mFormId = mCtx.recordHeader.record.id;
+            if (bytesRead != mCtx.recHeaderSize)
+            {
+                if (bytesRead == 0 && mDiagnostics->mRecordOffset == mFileSize)
+                    return false;
+                fail("Truncated record header");
+            }
+            const std::uint64_t recordSize = mCtx.recordHeader.record.typeId == REC_GRUP
+                ? mCtx.recordHeader.group.groupSize
+                : static_cast<std::uint64_t>(mCtx.recHeaderSize) + mCtx.recordHeader.record.dataSize;
+            if (!mDiagnostics->mRecordOffset || recordSize < mCtx.recHeaderSize
+                || *mDiagnostics->mRecordOffset > mFileSize || recordSize > mFileSize - *mDiagnostics->mRecordOffset)
+                fail("Record or group extends beyond the end of the file");
+            if (!mCtx.groupStack.empty())
+            {
+                const auto& [parent, consumed] = mCtx.groupStack.back();
+                if (consumed > parent.groupSize || recordSize > parent.groupSize - consumed)
+                    fail("Record or group extends beyond its parent group");
+            }
+        }
 
         // keep track of data left to read from the file
         mCtx.fileRead += mCtx.recHeaderSize;
@@ -540,8 +602,7 @@ namespace ESM4
         if ((mCtx.recordHeader.record.flags & Rec_Compressed) != 0)
         {
             if (mCtx.recordHeader.record.dataSize < sizeof(std::uint32_t))
-                throw std::runtime_error("Compressed record is too small");
-
+                fail("Compressed record is missing its uncompressed size");
             mStream->read(reinterpret_cast<char*>(&uncompressedSize), sizeof(std::uint32_t));
 
             const std::streamoff position = mStream->tellg();
@@ -559,7 +620,7 @@ namespace ESM4
 
             mCtx.recordHeader.record.dataSize = uncompressedSize;
 
-            auto memoryStreamPtr = decompress(position, compressed, uncompressedSize);
+            auto memoryStreamPtr = decompress(position, compressed, uncompressedSize, mDiagnostics != nullptr);
 
             // For debugging only
             // #if 0
@@ -589,13 +650,24 @@ namespace ESM4
     {
         if (mCtx.recordRead > mCtx.recordHeader.record.dataSize)
             throw std::runtime_error("Skipping after reading more than available");
-        mStream->ignore(mCtx.recordHeader.record.dataSize - mCtx.recordRead);
+        const auto size = mCtx.recordHeader.record.dataSize - mCtx.recordRead;
+        mStream->ignore(size);
+        if (mDiagnostics != nullptr && mStream->gcount() != size)
+            fail("Truncated skipped record data");
         mCtx.recordRead = mCtx.recordHeader.record.dataSize; // for getSubRecordHeader()
     }
 
     bool Reader::getSubRecordHeader()
     {
         bool result = false;
+        if (mDiagnostics != nullptr)
+        {
+            if (mCtx.recordRead > mCtx.recordHeader.record.dataSize)
+                fail("Subrecord extends beyond the record payload");
+            const auto remaining = mCtx.recordHeader.record.dataSize - mCtx.recordRead;
+            if (remaining != 0 && remaining < sizeof(mCtx.subRecordHeader))
+                fail("Truncated subrecord header");
+        }
         // NOTE: some SubRecords have 0 dataSize (e.g. SUB_RDSD in one of REC_REGN records in Oblivion.esm).
         if (mCtx.recordHeader.record.dataSize - mCtx.recordRead >= sizeof(mCtx.subRecordHeader))
         {
@@ -618,6 +690,16 @@ namespace ESM4
             return false;
         }
 
+        if (result && mDiagnostics != nullptr)
+        {
+            mDiagnostics->mSubrecordType = mCtx.subRecordHeader.typeId;
+            ++mDiagnostics->mSubrecords[{ mDiagnostics->mRecordType, mCtx.subRecordHeader.typeId }].mHeadersSeen;
+            mDiagnosticSubrecordStart = mStream->tellg();
+            mDiagnosticSubrecordSize = mCtx.subRecordHeader.dataSize;
+            if (mCtx.recordRead > mCtx.recordHeader.record.dataSize)
+                fail("Subrecord extends beyond the record payload");
+        }
+
         // Extended storage subrecord redefines the following subrecord's size.
         // Would need to redesign the loader to support that, so skip over both subrecords.
         if (result && mCtx.subRecordHeader.typeId == ESM::fourCC("XXXX"))
@@ -627,6 +709,10 @@ namespace ESM4
             if (!getSubRecordHeader())
                 return false;
 
+            mDiagnosticSubrecordSize = extDataSize;
+            if (mDiagnostics != nullptr
+                && extDataSize > mCtx.recordHeader.record.dataSize - mCtx.recordRead + mCtx.subRecordHeader.dataSize)
+                fail("Extended subrecord extends beyond the record payload");
             skipSubRecordData(extDataSize);
             mCtx.recordRead += extDataSize - mCtx.subRecordHeader.dataSize;
             return getSubRecordHeader();
@@ -637,12 +723,27 @@ namespace ESM4
 
     void Reader::skipSubRecordData()
     {
-        mStream->ignore(mCtx.subRecordHeader.dataSize);
+        skipSubRecordData(mCtx.subRecordHeader.dataSize);
     }
 
     void Reader::skipSubRecordData(std::uint32_t size)
     {
+        if (mDiagnostics != nullptr)
+        {
+            auto& stats = mDiagnostics->mSubrecords[{ mDiagnostics->mRecordType, mCtx.subRecordHeader.typeId }];
+            if (mStream->tellg() == mDiagnosticSubrecordStart && size == mDiagnosticSubrecordSize)
+                ++stats.mWholeSkipCalls;
+            else
+                ++stats.mPartialSkipCalls;
+        }
         mStream->ignore(size);
+        if (mDiagnostics != nullptr)
+        {
+            mDiagnostics->mSubrecords[{ mDiagnostics->mRecordType, mCtx.subRecordHeader.typeId }]
+                .mBytesExplicitlySkipped += static_cast<std::uint64_t>(mStream->gcount());
+            if (mStream->gcount() != size)
+                fail("Truncated skipped subrecord data");
+        }
     }
 
     void Reader::enterGroup()
@@ -855,6 +956,8 @@ namespace ESM4
 
     bool Reader::getStringImpl(std::string& str, std::size_t size, std::istream& stream, bool hasNull)
     {
+        if (mDiagnostics != nullptr && hasNull && size == 0)
+            fail("String has no space for a null terminator");
         std::size_t newSize = size;
 
         if (mEncoder != nullptr)
@@ -886,6 +989,8 @@ namespace ESM4
                 {
                     char ch;
                     stream.read(&ch, 1); // read the null terminator
+                    if (mDiagnostics != nullptr && stream.gcount() != 1)
+                        fail("Truncated string terminator");
                     if (ch != '\0')
                         throw std::runtime_error("ESM4::Reader::getString string is not terminated with a null");
                 }
@@ -902,6 +1007,8 @@ namespace ESM4
         }
 
         str.clear();
+        if (mDiagnostics != nullptr)
+            fail("Truncated string data");
         return false; // FIXME: throw instead?
     }
 
@@ -912,7 +1019,11 @@ namespace ESM4
         mStream->read(input.data(), size);
 
         if (mStream->gcount() != static_cast<std::streamsize>(size))
+        {
+            if (mDiagnostics != nullptr)
+                fail("Truncated string array");
             return false;
+        }
 
         std::string_view inputView(input.data(), input.size());
         std::string buffer;

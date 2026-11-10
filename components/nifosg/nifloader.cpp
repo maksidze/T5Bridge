@@ -330,6 +330,7 @@ namespace NifOsg
         unsigned int mVersion, mUserVersion, mBethVersion;
         Resource::BgsmFileManager* mMaterialManager{ nullptr };
         Resource::ImageManager* mImageManager{ nullptr };
+        const SkinPose* mSkinPose = nullptr;
 
         size_t mFirstRootTextureIndex{ ~0u };
         bool mFoundFirstRootTexturingProperty = false;
@@ -818,7 +819,8 @@ namespace NifOsg
 
             // Hide collision shapes, but don't skip the subgraph
             // We still need to animate the hidden bones so the physics system can access them
-            if (nifNode == args.mCollisionNode)
+            if (nifNode == args.mCollisionNode
+                || (mBethVersion >= Nif::NIFFile::BethVersion::BETHVER_SKY && nifNode->mRecordType == Nif::RC_RootCollisionNode))
             {
                 args.mSkipMeshes = true;
                 node->setNodeMask(Loader::getHiddenNodeMask());
@@ -1786,6 +1788,63 @@ namespace NifOsg
             parentNode->addChild(drawable);
         }
 
+        void poseSkyrimGeometry(const Nif::NiSkinInstance& skin, const Nif::NiSkinPartition& partitions,
+            const osg::Matrixf& shapeToModel, std::vector<osg::Vec3f>& vertices, std::vector<osg::Vec3f>& normals) const
+        {
+            std::vector<osg::Matrixf> matrices(skin.mBones.size());
+            const auto modelToShape = osg::Matrixf::inverse(shapeToModel);
+            bool hasPose = false;
+            for (std::size_t i = 0; i < skin.mBones.size(); ++i)
+                if (const auto* bone = skin.mBones[i].getPtr())
+                    if (const auto posed = mSkinPose->find(bone->mName); posed != mSkinPose->end())
+                    {
+                        matrices[i] = shapeToModel * posed->second * modelToShape;
+                        hasPose = true;
+                    }
+            if (!hasPose)
+                return;
+            std::vector<bool> posed(vertices.size());
+            for (const auto& part : partitions.mPartitions)
+            {
+                if (part.mVertexMap.empty() || part.mBoneIndices.size() != part.mWeights.size()
+                    || part.mWeights.size() % part.mVertexMap.size() != 0)
+                    continue;
+                const auto weightsPerVertex = part.mWeights.size() / part.mVertexMap.size();
+                for (std::size_t local = 0; local < part.mVertexMap.size(); ++local)
+                {
+                    const auto vertex = part.mVertexMap[local];
+                    if (vertex >= vertices.size() || posed[vertex])
+                        continue;
+                    osg::Vec3f position, normal;
+                    float sum = 0.f;
+                    for (std::size_t i = 0; i < weightsPerVertex; ++i)
+                    {
+                        const auto index = local * weightsPerVertex + i;
+                        const auto bone = static_cast<unsigned char>(part.mBoneIndices[index]);
+                        const float weight = part.mWeights[index];
+                        if (weight <= 0.f || !std::isfinite(weight) || bone >= part.mBones.size()
+                            || part.mBones[bone] >= matrices.size())
+                            continue;
+                        const auto& transform = matrices[part.mBones[bone]];
+                        position += (vertices[vertex] * transform) * weight;
+                        if (vertex < normals.size())
+                            normal += osg::Matrixf::transform3x3(normals[vertex], transform) * weight;
+                        sum += weight;
+                    }
+                    if (sum > 0.f)
+                    {
+                        vertices[vertex] = position / sum;
+                        if (vertex < normals.size())
+                        {
+                            normal.normalize();
+                            normals[vertex] = normal;
+                        }
+                        posed[vertex] = true;
+                    }
+                }
+            }
+        }
+
         void handleBSGeometry(const Nif::NiAVObject* nifNode, const Nif::Parent* parent, osg::Group* parentNode,
             SceneUtil::CompositeStateSetUpdater* composite, const std::vector<unsigned int>& boundTextures,
             int animflags)
@@ -1793,13 +1852,34 @@ namespace NifOsg
             assert(isTypeBSGeometry(nifNode->mRecordType));
 
             auto bsTriShape = static_cast<const Nif::BSTriShape*>(nifNode);
-            const std::vector<unsigned short>& triangles = bsTriShape->mTriangles;
-            if (triangles.empty())
+            const auto* dynamicShape = dynamic_cast<const Nif::BSDynamicTriShape*>(bsTriShape);
+            const auto* vertexData = &bsTriShape->mVertData;
+            auto vertexFlags = bsTriShape->mVertDesc.mFlags;
+            const auto* triangles = &bsTriShape->mTriangles;
+            std::vector<unsigned short> partitionTriangles;
+            if (vertexData->empty() && triangles->empty() && !bsTriShape->mSkin.empty())
+            {
+                // Skyrim SE skinned shapes can keep their mesh entirely in NiSkinPartition.
+                // They use the authored bind pose when no preview pose is requested.
+                if (const auto* skin = dynamic_cast<const Nif::NiSkinInstance*>(bsTriShape->mSkin.getPtr()))
+                    if (const auto* partitions = skin->getPartitions(); partitions && !partitions->mVertexData.empty())
+                    {
+                        vertexData = &partitions->mVertexData;
+                        vertexFlags = partitions->mVertexDesc.mFlags;
+                        for (const auto& partition : partitions->mPartitions)
+                            if (std::all_of(partition.mTrueTriangles.begin(), partition.mTrueTriangles.end(),
+                                    [&](unsigned short index) { return index < vertexData->size(); }))
+                                partitionTriangles.insert(partitionTriangles.end(), partition.mTrueTriangles.begin(),
+                                    partition.mTrueTriangles.end());
+                        triangles = &partitionTriangles;
+                    }
+            }
+            if (triangles->empty())
                 return;
 
             osg::ref_ptr<osg::Geometry> geometry(new osg::Geometry);
             geometry->addPrimitiveSet(new osg::DrawElementsUShort(
-                osg::PrimitiveSet::TRIANGLES, static_cast<unsigned>(triangles.size()), triangles.data()));
+                osg::PrimitiveSet::TRIANGLES, static_cast<unsigned>(triangles->size()), triangles->data()));
 
             osg::ref_ptr<osg::Drawable> drawable = geometry;
 
@@ -1834,19 +1914,27 @@ namespace NifOsg
                 return result;
             };
 
-            const bool fullPrec = bsTriShape->mVertDesc.mFlags & Nif::BSVertexDesc::VertexAttribute::Full_Precision;
-            const bool hasVertices = bsTriShape->mVertDesc.mFlags & Nif::BSVertexDesc::VertexAttribute::Vertex;
-            const bool hasNormals = bsTriShape->mVertDesc.mFlags & Nif::BSVertexDesc::VertexAttribute::Normals;
-            const bool hasColors = bsTriShape->mVertDesc.mFlags & Nif::BSVertexDesc::VertexAttribute::Vertex_Colors;
-            const bool hasUV = bsTriShape->mVertDesc.mFlags & Nif::BSVertexDesc::VertexAttribute::UVs;
+            const bool fullPrec = vertexFlags & Nif::BSVertexDesc::VertexAttribute::Full_Precision;
+            const bool hasVertices = vertexFlags & Nif::BSVertexDesc::VertexAttribute::Vertex;
+            const bool hasNormals = vertexFlags & Nif::BSVertexDesc::VertexAttribute::Normals;
+            const bool hasColors = vertexFlags & Nif::BSVertexDesc::VertexAttribute::Vertex_Colors;
+            const bool hasUV = vertexFlags & Nif::BSVertexDesc::VertexAttribute::UVs;
 
             std::vector<osg::Vec3f> vertices;
             std::vector<osg::Vec3f> normals;
             std::vector<osg::Vec4ub> colors;
             std::vector<osg::Vec2f> uvlist;
-            for (auto& elem : bsTriShape->mVertData)
+            const bool useDynamicVertices = mBethVersion == Nif::NIFFile::BethVersion::BETHVER_SSE && dynamicShape
+                && dynamicShape->mDynamicData.size() == vertexData->size();
+            for (std::size_t i = 0; i < vertexData->size(); ++i)
             {
-                if (hasVertices)
+                const auto& elem = (*vertexData)[i];
+                if (useDynamicVertices)
+                {
+                    const auto& vertex = dynamicShape->mDynamicData[i];
+                    vertices.emplace_back(vertex.x(), vertex.y(), vertex.z());
+                }
+                else if (hasVertices)
                 {
                     if (fullPrec)
                         vertices.emplace_back(elem.mVertex.x(), elem.mVertex.y(), elem.mVertex.z());
@@ -1862,6 +1950,37 @@ namespace NifOsg
                 if (hasUV)
                     uvlist.emplace_back(halfToFloat(elem.mUV[0]), halfToFloat(elem.mUV[1]));
             }
+
+            if (mBethVersion == Nif::NIFFile::BethVersion::BETHVER_SSE && !bsTriShape->mSkin.empty())
+                if (const auto* skin = dynamic_cast<const Nif::NiSkinInstance*>(bsTriShape->mSkin.getPtr()))
+                {
+                    auto shapeToModel = nifNode->mTransform.toMatrix();
+                    for (auto ancestor = parent; ancestor; ancestor = ancestor->mParent)
+                        shapeToModel *= ancestor->mNiNode.mTransform.toMatrix();
+                    if (useDynamicVertices && skin->mRoot->mName == "BSFaceGenNiNodeSkinned"
+                        && shapeToModel.getTrans().length2() < .01f)
+                    {
+                        // FaceGen hair, brows, eyes and mouths can store vertices in head
+                        // space without putting the head transform on the mesh node.
+                        for (const auto& bone : skin->mBones)
+                            if (bone->mName.ends_with("[Head]"))
+                            {
+                                const auto center = bsTriShape->mBoundingSphere.center() * shapeToModel;
+                                const auto head = bone->mTransform.mTranslation;
+                                if ((center - head).length2() < center.length2())
+                                    break; // Some exported FaceGen parts are already in actor space.
+                                const auto toHead = bone->mTransform.toMatrix() * osg::Matrixf::inverse(shapeToModel);
+                                for (auto& vertex : vertices)
+                                    vertex = vertex * toHead;
+                                for (auto& normal : normals)
+                                    normal = osg::Matrixf::transform3x3(normal, toHead);
+                                break;
+                            }
+                    }
+                    if (mSkinPose)
+                        if (const auto* partitions = skin->getPartitions())
+                            poseSkyrimGeometry(*skin, *partitions, shapeToModel, vertices, normals);
+                }
 
             if (!vertices.empty())
                 geometry->setVertexArray(new osg::Vec3Array(static_cast<unsigned>(vertices.size()), vertices.data()));
@@ -2897,6 +3016,10 @@ namespace NifOsg
                             break;
                         }
                         mat->setAlpha(shaderprop->mAlpha);
+                        if (mBethVersion == Nif::NIFFile::BethVersion::BETHVER_SSE
+                            && shaderprop->mType == static_cast<unsigned>(Nif::BSLightingShaderType::ShaderType_HairTint)
+                            && shaderprop->mHairTintColor.length2() > 0.f)
+                            mat->setDiffuse(osg::Vec4f(shaderprop->mHairTintColor, shaderprop->mAlpha));
                         mat->setEmission(osg::Vec4f(shaderprop->mEmissive, 1.f));
                         mat->setSpecular(osg::Vec4f(shaderprop->mSpecular, 1.f));
                         mat->setShininess(shaderprop->mGlossiness);
@@ -3034,6 +3157,16 @@ namespace NifOsg
         LoaderImpl impl(file.getFilename(), file.getVersion(), file.getUserVersion(), file.getBethVersion());
         impl.mMaterialManager = materialManager;
         impl.mImageManager = imageManager;
+        return impl.load(file);
+    }
+
+    osg::ref_ptr<osg::Node> Loader::loadPosed(Nif::FileView file, Resource::ImageManager* imageManager,
+        Resource::BgsmFileManager* materialManager, const SkinPose& pose)
+    {
+        LoaderImpl impl(file.getFilename(), file.getVersion(), file.getUserVersion(), file.getBethVersion());
+        impl.mMaterialManager = materialManager;
+        impl.mImageManager = imageManager;
+        impl.mSkinPose = &pose;
         return impl.load(file);
     }
 
