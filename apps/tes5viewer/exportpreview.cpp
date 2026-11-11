@@ -424,8 +424,9 @@ namespace TES5Viewer
                 }
                 const auto inverse = osg::Matrixd::inverse(meshTransform);
                 const bool character = mObject.starts_with("T54UEPlayer_") && !weights.empty();
+                const bool useSkinBind = character || (mPreview->rebindSkin && !weights.empty());
                 std::vector<osg::Matrixd> bindTransforms;
-                if (character && skin && !skin->mData.empty())
+                if (useSkinBind && skin && !skin->mData.empty())
                 {
                     const auto& rig=getRig(rigPath); const auto globals=rig.worldMatrices();
                     std::vector<std::optional<osg::Matrixd>> bindings(rig.joints.size());
@@ -447,9 +448,8 @@ namespace TES5Viewer
                 }
                 std::vector<osg::Vec3f> bindPositions, bindNormals;
                 CharacterSeamResult seam;
-                if (character)
+                if (useSkinBind)
                 {
-                    if (mSeamObject!=mObject) { mSeamObject=mObject; mCharacterNeck={}; }
                     for (std::size_t i=0;i<vertices->size();++i)
                     {
                         const auto& matrix=bindTransforms.empty() ? meshTransform : bindTransforms[i];
@@ -458,6 +458,10 @@ namespace TES5Viewer
                         if (normals && i<normals->size()) normal=osg::Matrixd::transform3x3(osg::Matrixd::inverse(matrix),osg::Vec3d((*normals)[i]));
                         normal.normalize(); bindNormals.push_back(normal);
                     }
+                }
+                if (character)
+                {
+                    if (mSeamObject!=mObject) { mSeamObject=mObject; mCharacterNeck={}; }
                     if (shader.type==5) mCharacterNeck.consider(bindPositions,bindNormals,weights,characterRims(bindPositions,triangles.values));
                     if (shader.type==4) seam=fitCharacterNeck(bindPositions,bindNormals,weights,triangles.values,mCharacterNeck);
                 }
@@ -554,11 +558,11 @@ namespace TES5Viewer
                 mManifest << '}';
                 for (std::size_t i = 0; i < vertices->size(); ++i)
                 {
-                    const auto p = character ? osg::Vec3d(bindPositions[i]) : osg::Vec3d((*vertices)[i]) * meshTransform - meshOrigin;
+                    const auto p = useSkinBind ? osg::Vec3d(bindPositions[i]) : osg::Vec3d((*vertices)[i]) * meshTransform - meshOrigin;
                     auto n = normals && i < normals->size()
                         ? osg::Matrixd::transform3x3(inverse, osg::Vec3d((*normals)[i]))
                         : osg::Vec3d(0, 0, 1);
-                    if (character) n=bindNormals[i];
+                    if (useSkinBind) n=bindNormals[i];
                     if (n.normalize() == 0.)
                         n.set(0, 0, 1);
                     const auto tex = uv && i < uv->size() ? (*uv)[i] : osg::Vec2f();

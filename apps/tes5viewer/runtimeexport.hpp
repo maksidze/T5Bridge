@@ -44,7 +44,7 @@ namespace TES5Viewer
         RuntimeScriptBatch* scripts = nullptr, std::span<const std::uint32_t> tracked = {});
     void addRuntimeStaticPlacement(CellScene& scene, const ExteriorReference& reference, const ReadWinningRecord& read);
     void exportPlayerView(const VFS::Manager& vfs, const ReadWinningRecord& read, std::uint32_t player,
-        const std::set<std::uint32_t>& equipped, const std::string& weaponModel, PreviewBundle& bundle);
+        const std::set<std::uint32_t>& equipped, const std::string& weaponModel, PreviewBundle& bundle, bool firstPerson = true);
     std::string exportAnimationObject(const VFS::Manager& vfs, const ReadWinningRecord& read,
         const std::string& model, PreviewBundle& bundle, bool requireSocket = true);
 }

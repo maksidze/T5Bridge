@@ -1,5 +1,7 @@
 #include "runtimeexport.hpp"
 
+#include <format>
+
 #include "actorappearance.hpp"
 #include "actorpose.hpp"
 #include "checkpointtypes.hpp"
@@ -379,9 +381,9 @@ namespace TES5Viewer
     }
 
     void exportPlayerView(const VFS::Manager& vfs, const ReadWinningRecord& read, std::uint32_t player,
-        const std::set<std::uint32_t>& equipped, const std::string& weaponModel, PreviewBundle& bundle)
+        const std::set<std::uint32_t>& equipped, const std::string& weaponModel, PreviewBundle& bundle, bool firstPerson)
     {
-        const auto appearance = loadActorAppearance(read, vfs, {}, player, equipped, true);
+        const auto appearance = loadActorAppearance(read, vfs, {}, player, equipped, firstPerson);
         const ToUTF8::StatelessUtf8Encoder encoder(ToUTF8::calculateEncoding("win1252"));
         Resource::ResourceSystem resources(&vfs, 30., &encoder);
         const auto load = [&](const std::string& path) {
@@ -392,20 +394,29 @@ namespace TES5Viewer
         };
         std::vector<osg::ref_ptr<osg::Node>> nodes;
         std::vector<PreviewObject> objects;
-        auto arms = osg::ref_ptr(new osg::Group);
-        if (appearance.skinTone) arms->setUserValue("helgenSkinTone", *appearance.skinTone);
+        auto body = osg::ref_ptr(new osg::Group);
+        if (appearance.skinTone) body->setUserValue("helgenSkinTone", *appearance.skinTone);
         for (const auto& path : appearance.models)
         {
             auto node = load(path);
             if (const auto blend = appearance.weightBlends.find(path); blend != appearance.weightBlends.end())
                 blendWeightModels(*node, *load(blend->second.otherModel), blend->second.fraction);
-            arms->addChild(node);
+            body->addChild(node);
         }
-        if (arms->getNumChildren())
+        if (body->getNumChildren())
         {
-            nodes.push_back(arms);
-            objects.push_back({"Arms", "NPC", arms.get(), nullptr, nullptr, true, appearance.skeleton});
-            objects.back().skinTextures = appearance.skinTextures;
+            nodes.push_back(body);
+            objects.push_back({firstPerson ? "Arms" : "T54UEPlayer_Body", "NPC", body.get(),
+                nullptr, nullptr, true, appearance.skeleton});
+            auto& object = objects.back();
+            object.skinTextures = appearance.skinTextures;
+            object.rebindSkin = true;
+            if (!firstPerson)
+            {
+                object.animationProject = appearance.animationProject;
+                object.creationMorphs = appearance.creationMorphs;
+                bundle.emplace("body.json", std::format("{{\"scale\":{}}}", appearance.height));
+            }
         }
         if (!weaponModel.empty() && vfs.exists(VFS::Path::Normalized(weaponModel)))
         {

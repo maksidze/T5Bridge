@@ -45,6 +45,7 @@ namespace TES5Viewer
         std::map<std::string, std::string, std::less<>> expressionMorphs;
         std::map<std::string, std::vector<std::string>, std::less<>> creationMorphs;
         std::map<std::string, std::array<std::string,8>, std::less<>> skinTextures;
+        bool rebindSkin = false;
     };
 
     void exportPreview(PreviewBundle& bundle, const VFS::Manager& vfs, Resource::NifFileManager& nifFiles,

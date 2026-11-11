@@ -3857,6 +3857,19 @@ T5_BRIDGE_API void* T5PapyrusPlayerView(const void* handle) noexcept
     });
 }
 
+T5_BRIDGE_API void* T5PapyrusPlayerBody(const void* handle) noexcept
+{
+    return performLoad([&](LoadResult& result) {
+        const auto& state = static_cast<const PapyrusSession*>(handle)->state;
+        if (!state || !state->vfs) throw std::runtime_error("Player body has no mounted resources");
+        const auto outfit = state->outfits.find(0x14);
+        const std::set<std::uint32_t> empty;
+        TES5Viewer::exportPlayerView(*state->vfs, state->read, state->world.actorBase(0x14),
+            outfit != state->outfits.end() ? outfit->second : empty, {}, result.buffers, false);
+        if (state->character) result.buffers.emplace("morphs.json", state->characterMorphs);
+    });
+}
+
 T5_BRIDGE_API void T5PapyrusTick(void* handle, double delta) noexcept
 {
     auto& session = *static_cast<PapyrusSession*>(handle);
